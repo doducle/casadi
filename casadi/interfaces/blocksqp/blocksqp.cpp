@@ -759,7 +759,7 @@ namespace casadi {
     m->ret_ = ret;
 
     if (ret==1 && print_maxit_reached_) casadi_warning("Maximum number of iterations reached");
-
+    
     // Get optimal cost
     if (m->f) *m->f = m->obj;
     // Get constraints at solution
@@ -2148,9 +2148,9 @@ namespace casadi {
 
   void Blocksqp::
   calcHessianUpdateExact(BlocksqpMemory* m) const {
-    // compute exact hessian
+    // compute exact hessian 
     (void)evaluate(m, m->exact_hess_lag);
-
+    
     // assign exact hessian to blocks
     const int* col = exact_hess_lag_sp_.colind();
     const int* row = exact_hess_lag_sp_.row();
@@ -2169,22 +2169,6 @@ namespace casadi {
         }
       }
     }
-    /*
-    cout << "xk: " << vector<double>(m->xk,m->xk+nx_) << endl;
-    cout << "lam_gk: " << vector<double>(m->lam_gk,m->lam_gk+ng_) << endl;
-    cout << "lam_xk: " << vector<double>(m->lam_xk,m->lam_xk+nx_) << endl;
-    cout << "exact_hess_lag: " << vector<double>(m->exact_hess_lag,m->exact_hess_lag+exact_hess_lag_sp_.nnz()) << endl;
-    cout << "exact_hess_lag row: " << vector<double>(exact_hess_lag_sp_.row(),exact_hess_lag_sp_.row()+exact_hess_lag_sp_.nnz()) << endl;
-    cout << "exact_hess_lag colind: " << vector<double>(exact_hess_lag_sp_.colind(),exact_hess_lag_sp_.colind()+nx_+1) << endl;
-
-    cout << "blocks_: " << blocks_ << endl;
-    cout << "dim_: " << dim_ << endl;
-    cout << "nnz_H_: " << nnz_H_ << endl;
-
-    for(int k=0; k<nblocks_;k++){
-      cout << "block " << k << ": " << vector<double>(m->hess[k],m->hess[k]+dim_[k]*dim_[k]) << endl;
-    }
-    */
 
     // Prepare to compute fallback update as well
     m->hess = m->hess2;
@@ -2322,7 +2306,7 @@ namespace casadi {
   void Blocksqp::
   computeNextHessian(BlocksqpMemory* m, int idx, int maxQP) const {
     // Compute fallback update only once
-    if (idx == 1) {
+    if (idx == 1 && conv_strategy_ < 2) {
         // Switch storage
         m->hess = m->hess2;
 
@@ -2369,7 +2353,7 @@ namespace casadi {
     if(conv_strategy_ == 1){
       //switch storage again
       m->hess = m->hess1;
-      // add scales Identity only if not the last trial Hessian and maxQP > 2
+      // add scaled Identity only if not the last trial Hessian and maxQP > 2
       if (maxQP > 2 && idx < maxQP - 1){
         // compute scalar delta_w for scaling Identity
         if(idx == 1){
@@ -2400,6 +2384,48 @@ namespace casadi {
         m->hess = m->hess2;
     }
 
+    if(conv_strategy_ == 2){
+      m->skip_hess = false;
+      // compute SR1 update as first fallback hessian
+      if(idx == 1){
+        // Switch storage
+        m->hess = m->hess2;
+
+        // If last block contains exact Hessian, we need to copy it
+        if (which_second_derv_ == 1) {
+          int dim = dim_[nblocks_-1];
+          casadi_copy(m->hess1[nblocks_-1], dim*dim, m->hess2[nblocks_-1]);
+        }
+        
+        // conv_startegy == 2: first fallback hessian SR1 works only in combination with Limited memory
+        if(hess_lim_mem_){
+          m->itCount--;
+          int fstFallbackUpdate = 1;
+          int fstFallbackScaling = 2;
+          int hessDampSave = hess_damp_;
+          const_cast<Blocksqp*>(this)->hess_damp_ = 1;
+          calcHessianUpdateLimitedMemory(m, fstFallbackUpdate, fstFallbackScaling);
+          const_cast<Blocksqp*>(this)->hess_damp_ = hessDampSave;
+          m->itCount++;
+        }
+        else{
+           // skip SR1 update otherwise
+           m->skip_hess = true;
+        }
+      }
+      else{
+        // Limited memory: compute fallback update only when needed
+        if (hess_lim_mem_) {
+            m->itCount--;
+            int hessDampSave = hess_damp_;
+            const_cast<Blocksqp*>(this)->hess_damp_ = 1;
+            calcHessianUpdateLimitedMemory(m, fallback_update_, fallback_scaling_);
+            const_cast<Blocksqp*>(this)->hess_damp_ = hessDampSave;
+            m->itCount++;
+          }
+      }
+    }
+
   }
 
 
@@ -2411,12 +2437,14 @@ namespace casadi {
   solveQP(BlocksqpMemory* m, double* deltaXi, double* lambdaQP,
     bool matricesChanged) const {
     int maxQP, l;
-    double scalar = 0.0;
     if (globalization_ &&
         (hess_update_ == 1 || hess_update_ == 4) &&
         matricesChanged &&
         m->itCount > 1) {
-        maxQP = max_conv_qp_ + 1;
+        if((hess_update_ == 4 && conv_strategy_ == 2))
+          maxQP = 3;
+        else
+          maxQP = max_conv_qp_ + 1;
       } else {
       maxQP = 1;
     }
@@ -2458,7 +2486,7 @@ namespace casadi {
     int maxIt = matricesChanged ? max_it_qp_ : 0.1*max_it_qp_;
     qpOASES::SolutionAnalysis solAna;
     qpOASES::returnValue ret;
-
+    
     /*
      * QP solving loop for convex combinations (sequential)
      */
@@ -2470,10 +2498,9 @@ namespace casadi {
           // If the solution of the first QP was rejected, consider second Hessian
           m->qpResolve++;
           computeNextHessian(m, l, maxQP);
-          if(conv_strategy_==1 && l<maxQP-1 && m->delta_w <= deltabar_w_max_)
-            scalar += m->delta_w; // save scalars for restoring Hessian
+          if(m->skip_hess) continue;
         }
-
+        
         if (l == maxQP-1) {
           // Enable inertia correction for supposedly convex QPs, just in case
           opts.enableInertiaCorrection = qpOASES::BT_TRUE;
@@ -2529,9 +2556,25 @@ namespace casadi {
             if (ret == qpOASES::SUCCESSFUL_RETURN) {
               // QP was solved successfully and curvature is positive after removing bounds
                 m->qpIterations = maxIt + 1;
-                m->delta_w_last = m->delta_w; // safe successful scaling factor
+                // restore Hessian after conv_strategy 1
+                if(l > 0 && conv_strategy_ == 1){
+                  m->delta_w_last = m->delta_w; // safe successful scaling factor
+                  for (int b=0; b<nblocks_; b++) {
+                    int dim = dim_[b];
+                    for (int i=0; i<dim; i++)
+                      m->hess1[b][i+i*dim] -= m->delta_w;
+                  }
+                }
                 break; // Success!
               } else {
+                // restore Hessian after failed failed conv_strategy 1
+                if(l > 0 && conv_strategy_ == 1){
+                  for (int b=0; b<nblocks_; b++) {
+                    int dim = dim_[b];
+                    for (int i=0; i<dim; i++)
+                      m->hess1[b][i+i*dim] -= m->delta_w;
+                  }
+                }
               // QP solution is rejected, save statistics
                 if (ret == qpOASES::RET_SETUP_AUXILIARYQP_FAILED)
                   m->qpIterations2++;
@@ -2543,7 +2586,7 @@ namespace casadi {
             // Convex QP was solved, no need to check assumption (G3*)
             m->qpIterations += maxIt + 1;
           }
-
+     
       } // End of QP solving loop
 
     /*
@@ -2566,15 +2609,6 @@ namespace casadi {
 
     // Point Hessian again to the first Hessian
     m->hess = m->hess1;
-
-    /* Restore Hessian if scaled Identities were added */
-    if(conv_strategy_ == 1){
-      for (int b=0; b<nblocks_; b++) {
-          int dim = dim_[b];
-          for (int i=0; i<dim; i++)
-            m->hess1[b][i+i*dim] -= scalar;
-      }
-    }
 
     /* For full-memory Hessian: Restore fallback Hessian if convex combinations
      * were used during the loop */
@@ -2892,6 +2926,7 @@ namespace casadi {
 
     m->delta_w = 0.0;
     m->delta_w_last = 0.0;
+    m->skip_hess = false;
   }
 
   int Blocksqp::

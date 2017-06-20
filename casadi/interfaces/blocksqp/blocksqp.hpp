@@ -144,6 +144,7 @@ namespace casadi {
      */
     double delta_w;  // current trial scaling factor
     double delta_w_last;  // last successful scaling factor for conv_strategy_ = 1 (add multiples of Identity)
+    bool skip_hess;
   };
 
   /** \brief \pluginbrief{Nlpsol,blocksqp}
